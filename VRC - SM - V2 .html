@@ -4,16 +4,16 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>VRC Session Manager</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.263.0/dist/umd/lucide.min.js"></script>
   <style>
     * { box-sizing: border-box; }
-    body { 
+    html, body { 
+      height: 100%;
       margin: 0; 
       padding: 0; 
       font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
     }
-    html, body { height: 100%; }
     #app { 
       height: 100%; 
       display: flex; 
@@ -21,10 +21,15 @@
       background: #0f172a;
       color: #e2e8f0;
     }
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    .loading-spinner {
+      animation: spin 1s linear infinite;
+      display: inline-block;
+    }
   </style>
-  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
-  <script src="https://cdn.jsdelivr.net/npm/lucide@0.263.0/dist/umd/lucide.min.js"></script>
-  <style>body { box-sizing: border-box; }</style>
   <script>
     const STORAGE_KEY = 'vrc_playtest_manager';
     const VERSION = '1.0.0';
@@ -57,151 +62,404 @@
 
     const authManager = new AuthManager();
 
-    class PlaytestManager {
+    // ===== GOOGLE SHEETS ADAPTER =====
+    class GoogleSheetsAdapter {
       constructor() {
-        this.data = this.loadData();
-        this.currentFilter = null; // Pas de filtre par défaut
-        this.init();
+        this.isReady = false;
+        this.data = { sessions: [], items: [] };
+        this.onDataChangeCallback = null;
+        this.lastError = null;
+        // Configuration Google Sheets
+        this.SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxnuK6htbwuLj0sKSYClIxfGYHt5v_-hjf-VnR8XQqIBq778L0wtPd2j90mLPnVEnEq/exec';
+        this.SHEET_ID = '1FZ3Bskr59Na8Xnh4SCbw4ZZ5kmzdcagF9wMJYixoFzY';
+        this.AUTH_TOKEN = 'vrc_secret_2026_changeme_SECURELY';
       }
 
-      loadData() {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        return saved ? JSON.parse(saved) : { sessions: [], items: [] };
+      async initialize() {
+        try {
+          console.log('🔄 Initializing Google Sheets adapter...');
+          // Récupérer les données existantes
+          const response = await fetch(this.SCRIPT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              action: 'getRawData',
+              auth: this.AUTH_TOKEN
+            })
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const result = await response.json();
+          
+          if (result.success && result.data) {
+            // Parser les données du sheet
+            this.parseSheetData(result.data);
+          }
+          
+          this.isReady = true;
+          console.log('✓ Google Sheets initialized');
+        } catch (error) {
+          console.error('Failed to initialize Google Sheets:', error);
+          this.lastError = error.message;
+          throw error;
+        }
       }
 
-      saveData() {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data));
-        this.render();
-      }
+      parseSheetData(rawData) {
+        this.data = { sessions: [], items: [] };
+        // Premier élément est l'en-tête, on ignore
+        if (!Array.isArray(rawData) || rawData.length <= 1) return;
 
-      // ===== DATA OPERATIONS =====
-      addSession(sessionData) {
-        const now = new Date();
-        const session = {
-          id: Date.now().toString(),
-          gameName: sessionData.gameName,
-          date: sessionData.date,
-          number: this.data.sessions.length + 1,
-          panelSize: sessionData.panelSize,
-          noteTaker: sessionData.noteTaker,
-          remarks: sessionData.remarks,
-          startTime: now.toLocaleTimeString('fr-FR'),
-          startTimestamp: now.getTime(),
-          isActive: true,
-          duration: '',
-          createdAt: new Date().toISOString()
-        };
-        this.data.sessions.push(session);
-        this.selectedSessionId = session.id;
-        this.saveData();
-        this.startSessionTimer(session.id);
-        return session.id;
-      }
+        for (let i = 1; i < rawData.length; i++) {
+          const row = rawData[i];
+          if (!row || row.length === 0) continue;
 
-      async addItem(itemData) {
-        const session = this.data.sessions.find(s => s.id === itemData.sessionId);
-        const elapsedTime = session && session.isActive ? this.getSessionElapsedTime(itemData.sessionId) : (session?.duration || '00:00:00');
-        
-        const item = {
-          id: Date.now().toString(),
-          sessionId: itemData.sessionId,
-          type: itemData.type, // bug, feedback, suggestion, debrief, task
-          severity: itemData.severity || 'info',
-          content: itemData.content,
-          tags: itemData.tags || '',
-          time: new Date().toLocaleTimeString('fr-FR'),
-          elapsedTime: elapsedTime,
-          createdAt: new Date().toISOString(),
-          wasAddedDuringSession: session?.isActive // Marquer si ajoutée pendant la session active
-        };
-        this.data.items.push(item);
-        this.saveData();
-        
-        // Sync to Supabase (direct via supabase-js)
-        if (window.supabaseSync?.createEntry) {
-          try {
-            const backendId = await window.supabaseSync.createEntry({
-              type: item.type,
-              content: item.content,
-              severity: item.severity,
-              session_id: item.sessionId,
-              game_name: session?.gameName || '',
-              session_date: session?.date || '',
-              elapsed_time: item.elapsedTime,
-              was_added_during_session: item.wasAddedDuringSession,
-              created_at: item.createdAt
+          const idValue = String(row[0] || '').trim();
+          const gameNameValue = String(row[2] || '').trim();
+          const sessionIdValue = String(row[15] || '').trim();
+          const itemTypeValue = String(row[12] || '').trim();
+          
+          // C'est une session si: id existe ET game_name existe ET type vide (colonne 12)
+          if (idValue && gameNameValue && !itemTypeValue) {
+            this.data.sessions.push({
+              id: idValue,
+              number: parseInt(row[1]) || 0,
+              game_name: gameNameValue,
+              date: String(row[3] || '').trim(),
+              panel_size: parseInt(row[4]) || 0,
+              note_taker: String(row[5] || '').trim(),
+              remarks: String(row[6] || '').trim(),
+              start_time: String(row[7] || '').trim(),
+              start_timestamp: parseInt(row[8]) || 0,
+              is_active: row[9] === 'TRUE' || row[9] === true,
+              duration: String(row[10] || '').trim(),
+              created_at: String(row[11] || new Date().toISOString())
             });
-            if (backendId) {
-              item.__backendId = backendId;
-              this.saveData();
-            }
-          } catch (error) {
-            console.error('Erreur sync Supabase:', error);
+          } 
+          // C'est un item si: id existe ET type existe ET session_id existe
+          else if (idValue && itemTypeValue && sessionIdValue) {
+            this.data.items.push({
+              id: idValue,
+              type: itemTypeValue,
+              severity: String(row[13] || 'info').trim(),
+              content: String(row[14] || '').trim(),
+              session_id: sessionIdValue,
+              game_name: String(row[16] || '').trim(),
+              session_date: String(row[17] || '').trim(),
+              elapsed_time: String(row[18] || '').trim(),
+              was_added_during_session: row[19] === 'TRUE' || row[19] === true,
+              created_at: String(row[20] || new Date().toISOString())
+            });
           }
         }
       }
 
-      updateItemStatus(itemId, newStatus) {
-        const item = this.data.items.find(i => i.id === itemId);
-        if (item) {
-          item.status = newStatus;
-          item.content = item.content; // Keep content unchanged
-          item.severity = item.severity;
-          item.assignedTo = item.assignedTo;
-          this.saveData();
+      async create(record) {
+        if (!this.isReady) throw new Error('Storage not initialized');
+        try {
+          // Ajouter le record en mémoire
+          if (record.is_active !== undefined) {
+            this.data.sessions.push(record);
+          } else if (record.session_id !== undefined) {
+            this.data.items.push(record);
+          }
+          
+          // Envoyer à Google Sheets
+          await this.syncToSheet();
+          if (this.onDataChangeCallback) {
+            this.onDataChangeCallback(this.data);
+          }
+        } catch (error) {
+          console.error('Create failed:', error);
+          this.lastError = error.message;
+          throw error;
         }
+      }
+
+      async update(record) {
+        if (!this.isReady) throw new Error('Storage not initialized');
+        try {
+          if (record.is_active !== undefined) {
+            const idx = this.data.sessions.findIndex(s => s.id === record.id);
+            if (idx >= 0) {
+              this.data.sessions[idx] = record;
+            }
+          } else if (record.session_id !== undefined) {
+            const idx = this.data.items.findIndex(i => i.id === record.id);
+            if (idx >= 0) {
+              this.data.items[idx] = record;
+            }
+          }
+          
+          await this.syncToSheet();
+          if (this.onDataChangeCallback) {
+            this.onDataChangeCallback(this.data);
+          }
+        } catch (error) {
+          console.error('Update failed:', error);
+          this.lastError = error.message;
+          throw error;
+        }
+      }
+
+      async delete(record) {
+        if (!this.isReady) throw new Error('Storage not initialized');
+        try {
+          if (record.is_active !== undefined) {
+            this.data.sessions = this.data.sessions.filter(s => s.id !== record.id);
+          } else if (record.session_id !== undefined) {
+            this.data.items = this.data.items.filter(i => i.id !== record.id);
+          }
+          
+          await this.syncToSheet();
+          if (this.onDataChangeCallback) {
+            this.onDataChangeCallback(this.data);
+          }
+        } catch (error) {
+          console.error('Delete failed:', error);
+          this.lastError = error.message;
+          throw error;
+        }
+      }
+
+      async syncToSheet() {
+        try {
+          const allRows = [];
+          
+          // Headers
+          allRows.push(['id', 'number', 'game_name', 'date', 'panel_size', 'note_taker', 'remarks', 'start_time', 'start_timestamp', 'is_active', 'duration', 'created_at', 'type', 'severity', 'content', 'session_id', 'game_name_item', 'session_date', 'elapsed_time', 'was_added_during_session']);
+          
+          // Sessions
+          this.data.sessions.forEach(s => {
+            allRows.push([
+              s.id, s.number, s.game_name, s.date, s.panel_size, s.note_taker, s.remarks, 
+              s.start_time, s.start_timestamp, s.is_active ? 'TRUE' : 'FALSE', s.duration, s.created_at,
+              '', '', '', '', '', '', '', ''
+            ]);
+          });
+          
+          // Items
+          this.data.items.forEach(i => {
+            allRows.push([
+              i.id, '', '', '', '', '', '', '', '', '',
+              '', '', i.type, i.severity, i.content, i.session_id, i.game_name, i.session_date, i.elapsed_time, i.was_added_during_session ? 'TRUE' : 'FALSE'
+            ]);
+          });
+
+          const response = await fetch(this.SCRIPT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              action: 'setRawData',
+              auth: this.AUTH_TOKEN,
+              data: JSON.stringify(allRows)
+            })
+          });
+
+          const result = await response.json();
+          if (!result.success) {
+            throw new Error(result.error || 'Failed to sync to sheet');
+          }
+        } catch (error) {
+          console.error('Sync to sheet failed:', error);
+          throw error;
+        }
+      }
+
+      setOnDataChange(callback) {
+        this.onDataChangeCallback = callback;
+      }
+
+      getCurrentData() {
+        return this.data;
+      }
+
+      getLastError() {
+        return this.lastError;
+      }
+    }
+
+    const storage = new GoogleSheetsAdapter();
+
+    class PlaytestManager {
+      constructor() {
+        this.selectedSessionId = null;
+        this.currentFilter = null;
+        this.currentGameFilter = null;
+        this.sessionTimers = {};
+        this.currentItemType = null;
+        this.currentEditItemId = null;
+        this.data = { sessions: [], items: [] };
+        this.initializeApp();
+      }
+
+      async initializeApp() {
+        try {
+          await storage.initialize();
+          this.data = storage.getCurrentData();
+          storage.setOnDataChange((data) => {
+            this.data = data;
+            this.render();
+          });
+          this.render();
+        } catch (error) {
+          // Show connection error screen
+          const app = document.getElementById('app');
+          app.innerHTML = `
+            <div class="flex h-full w-full items-center justify-center bg-gradient-to-br from-slate-900 via-red-950 to-slate-900">
+              <div class="text-center">
+                <div class="mb-8">
+                  <i data-lucide="wifi-off" style="width: 64px; height: 64px; margin: 0 auto 16px; color: #ef4444;"></i>
+                  <h1 class="text-4xl font-black text-red-400">Erreur de connexion</h1>
+                  <p class="text-red-300/70 text-sm tracking-widest uppercase mt-2">Google Sheets indisponible</p>
+                </div>
+                
+                <div class="bg-gradient-to-br from-slate-800 to-slate-900 rounded-xl shadow-2xl p-8 w-96 border border-red-800/50 shadow-red-500/20">
+                  <p class="text-red-200 mb-6">Impossible de se connecter à Google Sheets. Vérifiez :</p>
+                  <ul class="text-left text-sm text-red-300 space-y-2 mb-6">
+                    <li>✓ L'URL de déploiement Apps Script</li>
+                    <li>✓ Le token d'authentification</li>
+                    <li>✓ Votre connexion Internet</li>
+                    <li>✓ Les paramètres dans le code (lignes 220-221)</li>
+                  </ul>
+                  <p class="text-xs text-slate-400 italic">Erreur: ${error.message}</p>
+                  <button onclick="location.reload()" class="mt-6 w-full bg-gradient-to-r from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 px-4 py-3 rounded-lg text-white font-bold transition shadow-lg shadow-red-500/20">
+                    Réessayer
+                  </button>
+                </div>
+              </div>
+            </div>
+          `;
+          lucide.createIcons();
+        }
+      }
+
+      loadData() {
+        return this.data;
+      }
+
+      async saveData() {
+        this.render();
+      }
+
+      async addSession(sessionData) {
+        const now = new Date();
+        // Trouver le numéro le plus grand existant
+        const maxNumber = this.data.sessions.length > 0 
+          ? Math.max(...this.data.sessions.map(s => s.number || 0))
+          : 0;
+        
+        const sessionToCreate = {
+          id: Date.now().toString(),
+          number: maxNumber + 1,
+          game_name: sessionData.gameName,
+          date: sessionData.date,
+          panel_size: sessionData.panelSize,
+          note_taker: sessionData.noteTaker,
+          remarks: sessionData.remarks,
+          start_time: now.toLocaleTimeString('fr-FR'),
+          start_timestamp: now.getTime(),
+          is_active: true,
+          duration: '00:00:00',
+          created_at: new Date().toISOString()
+        };
+
+        await storage.create(sessionToCreate);
+        this.selectedSessionId = sessionToCreate.id;
+        this.startSessionTimer(sessionToCreate.id);
+        return sessionToCreate.id;
+      }
+
+      async addItem(itemData) {
+        const session = this.data.sessions.find(s => s.id === itemData.sessionId);
+        const elapsedTime = session && session.is_active ? this.getSessionElapsedTime(itemData.sessionId) : (session?.duration || '00:00:00');
+        
+        const itemToCreate = {
+          id: Date.now().toString() + Math.random(),
+          type: itemData.type,
+          severity: itemData.severity || 'info',
+          content: itemData.content,
+          session_id: itemData.sessionId,
+          game_name: session?.game_name || '',
+          session_date: session?.date || '',
+          elapsed_time: elapsedTime,
+          was_added_during_session: session?.is_active,
+          created_at: new Date().toISOString()
+        };
+
+        await storage.create(itemToCreate);
       }
 
       async updateItem(itemId, updates) {
         const item = this.data.items.find(i => i.id === itemId);
         if (item) {
-          Object.assign(item, updates);
-          this.saveData();
-          
-          // Sync to Supabase (direct via supabase-js)
-          if (window.supabaseSync?.updateEntry && item.__backendId) {
-            try {
-              const session = this.data.sessions.find(s => s.id === item.sessionId);
-              await window.supabaseSync.updateEntry(item.__backendId, {
-                type: item.type,
-                content: item.content,
-                severity: item.severity,
-                session_id: item.sessionId,
-                game_name: session?.gameName || '',
-                session_date: session?.date || '',
-                elapsed_time: item.elapsedTime,
-                was_added_during_session: item.wasAddedDuringSession,
-                created_at: item.createdAt
-              });
-            } catch (error) {
-              console.error('Erreur sync Supabase:', error);
-            }
-          }
+          const updated = { ...item, ...updates };
+          await storage.update(updated);
         }
       }
 
       async deleteItem(itemId) {
         const item = this.data.items.find(i => i.id === itemId);
-        this.data.items = this.data.items.filter(i => i.id !== itemId);
-        this.saveData();
-        
-        // Sync to Supabase (direct via supabase-js)
-        if (window.supabaseSync?.deleteEntry && item && item.__backendId) {
+        if (item) {
+          // Show loading state on delete button
+          const deleteBtn = document.querySelector(`[data-item-id="${itemId}"].delete-item-btn`);
+          if (deleteBtn) {
+            deleteBtn.disabled = true;
+            deleteBtn.innerHTML = '<i data-lucide="loader" style="width: 16px; height: 16px; animation: spin 1s linear infinite;"></i>';
+            lucide.createIcons();
+          }
+          
           try {
-            await window.supabaseSync.deleteEntry(item.__backendId);
+            await storage.delete(item);
           } catch (error) {
-            console.error('Erreur sync Supabase:', error);
+            console.error('Delete failed:', error);
+            if (deleteBtn) {
+              deleteBtn.disabled = false;
+              deleteBtn.innerHTML = '<i data-lucide="x" style="width: 16px; height: 16px;"></i>';
+              lucide.createIcons();
+            }
           }
         }
       }
 
-      deleteSession(sessionId) {
-        this.data.sessions = this.data.sessions.filter(s => s.id !== sessionId);
-        this.data.items = this.data.items.filter(i => i.sessionId !== sessionId);
-        this.saveData();
-        if (this.sessionTimers && this.sessionTimers[sessionId]) {
-          clearInterval(this.sessionTimers[sessionId]);
-          delete this.sessionTimers[sessionId];
+      async deleteSession(sessionId) {
+        // Show loading state on delete button
+        const deleteBtn = document.getElementById('btn-delete-session');
+        const originalHTML = deleteBtn?.innerHTML;
+        
+        if (deleteBtn) {
+          deleteBtn.disabled = true;
+          deleteBtn.innerHTML = '<i data-lucide="loader" class="loading-spinner" style="width: 18px; height: 18px; display: inline; margin-right: 6px;"></i> Suppression...';
+          lucide.createIcons();
+        }
+        
+        try {
+          // Delete all associated items
+          const itemsToDelete = this.data.items.filter(i => i.session_id === sessionId);
+          for (const item of itemsToDelete) {
+            await storage.delete(item);
+          }
+          
+          // Delete session
+          const session = this.data.sessions.find(s => s.id === sessionId);
+          if (session) {
+            await storage.delete(session);
+          }
+          
+          if (this.sessionTimers && this.sessionTimers[sessionId]) {
+            clearInterval(this.sessionTimers[sessionId]);
+            delete this.sessionTimers[sessionId];
+          }
+        } catch (error) {
+          console.error('Delete session failed:', error);
+          if (deleteBtn) {
+            deleteBtn.disabled = false;
+            deleteBtn.innerHTML = originalHTML;
+            lucide.createIcons();
+          }
         }
       }
 
@@ -211,8 +469,8 @@
         
         const updateElapsed = () => {
           const session = this.data.sessions.find(s => s.id === sessionId);
-          if (session && session.isActive) {
-            const elapsed = Date.now() - session.startTimestamp;
+          if (session && session.is_active) {
+            const elapsed = Date.now() - session.start_timestamp;
             const hours = Math.floor(elapsed / 3600000);
             const minutes = Math.floor((elapsed % 3600000) / 60000);
             const seconds = Math.floor((elapsed % 60000) / 1000);
@@ -231,23 +489,31 @@
       getSessionElapsedTime(sessionId) {
         const session = this.data.sessions.find(s => s.id === sessionId);
         if (!session) return '00:00:00';
-        const elapsed = Date.now() - session.startTimestamp;
+        const startTimestamp = typeof session.start_timestamp === 'string' 
+          ? new Date(session.start_timestamp).getTime() 
+          : session.start_timestamp;
+        const elapsed = Date.now() - startTimestamp;
         const hours = Math.floor(elapsed / 3600000);
         const minutes = Math.floor((elapsed % 3600000) / 60000);
         const seconds = Math.floor((elapsed % 60000) / 1000);
         return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
       }
 
-      endSession(sessionId) {
+      async endSession(sessionId) {
         const session = this.data.sessions.find(s => s.id === sessionId);
         if (session) {
-          session.isActive = false;
-          session.duration = this.getSessionElapsedTime(sessionId);
+          const updatedSession = {
+            ...session,
+            is_active: false,
+            duration: this.getSessionElapsedTime(sessionId)
+          };
+          
+          await storage.update(updatedSession);
+          
           if (this.sessionTimers && this.sessionTimers[sessionId]) {
             clearInterval(this.sessionTimers[sessionId]);
             delete this.sessionTimers[sessionId];
           }
-          this.saveData();
         }
       }
 
@@ -256,11 +522,11 @@
         if (!session) return '';
         
         const sessionItems = this.data.items
-          .filter(i => i.sessionId === sessionId)
-          .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+          .filter(i => i.session_id === sessionId)
+          .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
         
         if (sessionItems.length === 0) {
-          return `<div>[${session.startTime}] Aucune entrée enregistrée</div>`;
+          return `<div>[${session.start_time}] Aucune entrée enregistrée</div>`;
         }
 
         return sessionItems.map(item => {
@@ -272,7 +538,7 @@
             debrief: '[DEBRIEF]'
           }[item.type] || '[?]';
           
-          const timeDisplay = item.wasAddedDuringSession ? item.time : '[Après session]';
+          const timeDisplay = item.was_added_during_session ? item.elapsed_time : '[Après session]';
           return `<div>${timeDisplay} ${typeEmoji} ${item.content.substring(0, 60)}...</div>`;
         }).join('');
       }
@@ -391,8 +657,8 @@
               const newSession = {
                 ...session,
                 id: newSessionId,
-                startTimestamp: session.startTimestamp ? new Date(session.startTimestamp).getTime() : Date.now(),
-                createdAt: session.createdAt || new Date().toISOString()
+                start_timestamp: session.start_timestamp ? new Date(session.start_timestamp).getTime() : Date.now(),
+                created_at: session.created_at || new Date().toISOString()
               };
               newSessions.push(newSession);
             });
@@ -401,24 +667,28 @@
             const newItems = importedData.items.map(item => ({
               ...item,
               id: Date.now().toString() + Math.random(),
-              sessionId: sessionIdMap[item.sessionId] || newSessions[0]?.id,
-              createdAt: item.createdAt || new Date().toISOString()
+              session_id: sessionIdMap[item.session_id] || newSessions[0]?.id,
+              created_at: item.created_at || new Date().toISOString()
             }));
 
-            // Merge with existing data
-            this.data.sessions.push(...newSessions);
-            this.data.items.push(...newItems);
+            // Add to storage via adapter
+            (async () => {
+              for (const session of newSessions) {
+                await storage.create(session);
+              }
+              for (const item of newItems) {
+                await storage.create(item);
+              }
 
-            this.saveData();
-            
-            statusDiv.textContent = `✓ ${newSessions.length} session(s) et ${newItems.length} entrée(s) importées`;
-            statusDiv.className = 'text-sm text-green-400';
+              statusDiv.textContent = `✓ ${newSessions.length} session(s) et ${newItems.length} entrée(s) importées`;
+              statusDiv.className = 'text-sm text-green-400';
 
-            setTimeout(() => {
-              this.hideModal('modal-import');
-              fileInput.value = '';
-              statusDiv.textContent = '';
-            }, 2000);
+              setTimeout(() => {
+                this.hideModal('modal-import');
+                fileInput.value = '';
+                statusDiv.textContent = '';
+              }, 2000);
+            })();
           } catch (error) {
             statusDiv.textContent = `Erreur: ${error.message}`;
             statusDiv.className = 'text-sm text-red-400';
@@ -433,10 +703,9 @@
         let items = this.data.items;
         let sessions = this.data.sessions;
         
-        // Si un jeu est filtré, limiter aux sessions et items de ce jeu
         if (gameFilter) {
-          sessions = sessions.filter(s => s.gameName === gameFilter);
-          items = items.filter(i => sessions.some(s => s.id === i.sessionId));
+          sessions = sessions.filter(s => s.game_name === gameFilter);
+          items = items.filter(i => sessions.some(s => s.id === i.session_id));
         }
         
         const bugs = items.filter(i => i.type === 'bug');
@@ -460,17 +729,18 @@
         };
       }
 
-      init() {
-        this.render();
+      getAvailableGames() {
+        const games = new Set();
+        this.data.sessions.forEach(s => {
+          if (s.game_name) games.add(s.game_name);
+        });
+        return Array.from(games).sort();
       }
 
       render() {
-        this.renderUI();
-      }
-
-      renderUI() {
+        if (!this.data) this.data = { sessions: [], items: [] };
         const app = document.getElementById('app');
-        
+
         // Show auth screen if not authenticated
         if (!authManager.isAuthenticated) {
           app.innerHTML = `
@@ -551,7 +821,7 @@
       getAvailableGames() {
         const games = new Set();
         this.data.sessions.forEach(s => {
-          if (s.gameName) games.add(s.gameName);
+          if (s.game_name) games.add(s.game_name);
         });
         return Array.from(games).sort();
       }
@@ -606,7 +876,6 @@
                 ` : `
                   <div class="w-3 h-3 rounded-full bg-red-500 animate-pulse"></div>
                 `}
-              </div>
             </div>
           </header>
         `;
@@ -614,8 +883,8 @@
 
       renderSidebar() {
         const sessions = this.data.sessions;
-        const hasActiveSession = this.data.sessions.some(s => s.isActive);
-        const activeSession = this.data.sessions.find(s => s.isActive);
+        const hasActiveSession = this.data.sessions.some(s => s.is_active);
+        const activeSession = this.data.sessions.find(s => s.is_active);
         const selectedSessionId = this.selectedSessionId || activeSession?.id || (sessions.length > 0 ? sessions[0].id : null);
         
         return `
@@ -638,21 +907,21 @@
                 ${sessions.length === 0 ? '<p class="text-xs text-slate-500 italic">Aucune session</p>' : ''}
                 ${[...sessions].reverse().map((s, index) => {
                   const isSelected = s.id === selectedSessionId;
-                  const isLocked = hasActiveSession && !s.isActive;
+                  const isLocked = hasActiveSession && !s.is_active;
                   return `
                     <div class="bg-gradient-to-br from-slate-800/50 to-slate-900/50 border ${isSelected ? 'border-purple-500 shadow-lg shadow-purple-500/20' : 'border-purple-800/30 hover:border-purple-700/50'} rounded-lg p-4 ${isLocked ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'} transition-all hover:shadow-lg hover:shadow-purple-500/10 session-item ${isLocked ? 'locked-session' : ''}" data-session-id="${s.id}" ${isLocked ? 'style="pointer-events: none;"' : ''}>
                       <div class="flex items-start justify-between gap-2">
                         <div class="flex-1">
                           <div class="text-sm font-bold text-cyan-300">Session ${s.number}</div>
-                          <div class="text-xs text-purple-300 font-semibold mt-1">${s.gameName}</div>
-                          <div class="text-xs text-slate-500 mt-2">${s.date}</div>
+                          <div class="text-xs text-purple-300 font-semibold mt-1">${s.game_name || 'N/A'}</div>
+                          <div class="text-xs text-slate-500 mt-2">${s.date || 'N/A'}</div>
                           <div class="text-xs text-slate-600 mt-2 flex gap-2">
-                            <span>${s.panelSize} joueurs</span>
-                            <span>${s.duration}</span>
+                            <span>${s.panel_size || 0} joueurs</span>
+                            <span>${s.duration || '00:00:00'}</span>
                           </div>
-                          ${!s.isActive ? '<div class="text-xs text-slate-500 mt-2 italic">Session terminée</div>' : '<div class="text-xs text-green-400 mt-2 font-semibold animate-pulse">▶ En cours...</div>'}
+                          ${!s.is_active ? '<div class="text-xs text-slate-500 mt-2 italic">Session terminée</div>' : '<div class="text-xs text-green-400 mt-2 font-semibold animate-pulse">▶ En cours...</div>'}
                         </div>
-                        ${s.isActive ? '<div class="text-2xl text-green-400">●</div>' : ''}
+                        ${s.is_active ? '<div class="text-2xl text-green-400">●</div>' : ''}
                       </div>
                     </div>
                   `;
@@ -694,24 +963,48 @@
         }
 
         // Auto-select active session first, otherwise select last session
-        const activeSession = sessions.find(s => s.isActive);
+        const activeSession = sessions.find(s => s.is_active);
         const selectedSessionId = this.selectedSessionId || activeSession?.id || sessions[sessions.length - 1].id;
         const selectedSession = sessions.find(s => s.id === selectedSessionId) || sessions[sessions.length - 1];
-        const sessionItems = this.data.items.filter(i => i.sessionId === selectedSession.id);
-        const isSessionActive = selectedSession.isActive;
+        const sessionItems = this.data.items.filter(i => i.session_id === selectedSession.id);
+        const isSessionActive = selectedSession.is_active;
+
+        // Format dates properly
+        const formatDate = (dateStr) => {
+          if (!dateStr) return 'N/A';
+          try {
+            const date = new Date(dateStr);
+            return date.toLocaleDateString('fr-FR');
+          } catch {
+            return dateStr;
+          }
+        };
+
+        const formatTime = (timeStr) => {
+          if (!timeStr) return 'N/A';
+          if (timeStr.includes('T')) {
+            try {
+              const date = new Date(timeStr);
+              return date.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+            } catch {
+              return timeStr;
+            }
+          }
+          return timeStr;
+        };
         
         return `
           <main class="flex-1 overflow-y-auto bg-gradient-to-br from-slate-900 via-slate-950 to-slate-900 p-8 flex flex-col">
             <div class="max-w-5xl mx-auto flex-1">
               <div class="flex justify-between items-start mb-8">
                 <div>
-                  <h2 class="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-purple-400 mb-3">Session ${selectedSession.number} - ${selectedSession.gameName}</h2>
+                  <h2 class="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-purple-400 mb-3">Session ${selectedSession.number || 1} - ${selectedSession.game_name || 'N/A'}</h2>
                   <div class="text-slate-400 space-y-1.5 text-sm">
-                    <p>Début: <span class="text-cyan-300">${selectedSession.date}</span></p>
-                    ${selectedSession.startTime ? `<p>Heure: <span class="text-cyan-300">${selectedSession.startTime}</span></p>` : ''}
-                    ${isSessionActive ? `<p>Durée écoulée: <span class="text-purple-300" id="elapsed-time">00:00:00</span></p>` : `<p>Durée totale: <span class="text-purple-300">${selectedSession.duration}</span></p>`}
-                    <p>Panel: <span class="text-purple-300">${selectedSession.panelSize} joueurs</span></p>
-                    <p>Preneur de notes - GM: <span class="text-cyan-300">${selectedSession.noteTaker}</span></p>
+                    <p>Début: <span class="text-cyan-300">${formatDate(selectedSession.date)}</span></p>
+                    ${selectedSession.start_time ? `<p>Heure: <span class="text-cyan-300">${formatTime(selectedSession.start_time)}</span></p>` : ''}
+                    ${isSessionActive ? `<p>Durée écoulée: <span class="text-purple-300" id="elapsed-time">00:00:00</span></p>` : `<p>Durée totale: <span class="text-purple-300">${this.formatDuration(selectedSession.duration || '00:00:00')}</span></p>`}
+                    <p>Panel: <span class="text-purple-300">${selectedSession.panel_size || 0} joueurs</span></p>
+                    <p>Preneur de notes - GM: <span class="text-cyan-300">${selectedSession.note_taker || 'N/A'}</span></p>
                     ${selectedSession.remarks ? `<p>Remarques: <span class="text-purple-300">${selectedSession.remarks}</span></p>` : ''}
                   </div>
                 </div>
@@ -763,9 +1056,9 @@
                         <div style="border-left: 4px solid ${this.getSeverityHexColor(item.severity)};" class="bg-gradient-to-br from-slate-800/50 to-slate-900/50 border border-slate-700/50 rounded-lg p-5 hover:shadow-lg transition">
                           <div class="flex justify-between items-start gap-4">
                             <div class="flex-1">
-                              <p class="text-white font-semibold text-base">${item.content}</p>
+                              <p class="text-white font-semibold text-base">${item.content || 'N/A'}</p>
                               <div class="text-xs text-slate-400 mt-3 flex gap-3">
-                                ${item.wasAddedDuringSession ? `<span>Heure: <span class="text-cyan-300">${item.time}</span></span>` : `<span class="text-slate-500 italic">Ajoutée après la session</span>`}
+                                ${item.was_added_during_session ? `<span>Temps écoulé: <span class="text-cyan-300">${this.formatDuration(item.elapsed_time) || '00:00:00'}</span></span>` : `<span class="text-slate-500 italic">Ajoutée après la session</span>`}
                               </div>
                             </div>
                             <div class="flex gap-2">
@@ -788,13 +1081,13 @@
               <div class="bg-gradient-to-br from-slate-800/50 to-slate-900/50 border border-slate-700/50 rounded-lg p-6 mt-12">
                 <h3 class="text-lg font-bold text-white mb-4 uppercase tracking-wider text-center">Résumé de la Session - Journal</h3>
                 <div class="space-y-2 text-sm text-slate-300">
-                  ${this.generateSessionSummary(selectedSession.id)}
+                  ${this.generateSessionSummary(selectedSession.id) || '<div class="text-center text-slate-500 italic">Aucune entrée enregistrée</div>'}
                 </div>
               </div>
             </div>
 
             <div class="text-center text-xs text-slate-500 mt-12 pt-4 border-t border-slate-700/30">
-              <p>VRC Session Manager • Version ${VERSION}</p>
+              <p>VRC Session Manager • Version 1.120 • © Julien</p>
             </div>
           </main>
         `;
@@ -814,10 +1107,10 @@
         // Grouper par session
         const itemsBySession = {};
         filteredItems.forEach(item => {
-          if (!itemsBySession[item.sessionId]) {
-            itemsBySession[item.sessionId] = [];
+          if (!itemsBySession[item.session_id]) {
+            itemsBySession[item.session_id] = [];
           }
-          itemsBySession[item.sessionId].push(item);
+          itemsBySession[item.session_id].push(item);
         });
 
         const severityColor = {
@@ -852,7 +1145,7 @@
                   
                   return `
                     <div class="mb-12">
-                      <h3 class="text-2xl font-bold text-cyan-400 mb-6 pb-3 border-b border-purple-800/50">Session ${session.number} - ${session.gameName}</h3>
+                      <h3 class="text-2xl font-bold text-cyan-400 mb-6 pb-3 border-b border-purple-800/50">Session ${session.number} - ${session.game_name}</h3>
                       <div class="space-y-3">
                         ${items.map(item => `
                           <div style="border-left: 4px solid ${severityColor};" class="bg-gradient-to-br from-slate-800/50 to-slate-900/50 border border-slate-700/50 rounded-lg p-5 hover:shadow-lg transition">
@@ -861,7 +1154,7 @@
                                 <p class="text-white font-semibold text-base">${item.content}</p>
                                 <div class="text-xs text-slate-400 mt-3 flex gap-4">
                                   <span>Type: <span class="text-purple-300 font-semibold">${({bug: 'Bug', feedback: 'Retour', suggestion: 'Suggestion', task: 'Tâche', debrief: 'Débrief'}[item.type] || item.type)}</span></span>
-                                  ${item.wasAddedDuringSession ? `<span>Heure: <span class="text-cyan-300">${item.time}</span></span>` : `<span class="text-slate-500 italic">Après session</span>`}
+                                  <span>Sévérité: <span class="text-purple-300 font-semibold">${({critical: 'Critique', high: 'Élevé', medium: 'Moyen', low: 'Faible', info: 'Info'}[item.severity] || item.severity)}</span></span>
                                 </div>
                               </div>
                               <div class="flex gap-2">
@@ -890,7 +1183,7 @@
       }
 
       renderGameFilteredView() {
-        const filteredSessions = this.data.sessions.filter(s => s.gameName === this.currentGameFilter);
+        const filteredSessions = this.data.sessions.filter(s => s.game_name === this.currentGameFilter);
         
         // Collecter tous les items de ce jeu et les trier par sévérité
         const allGameItems = [];
@@ -898,7 +1191,7 @@
         
         filteredSessions.forEach(session => {
           this.data.items
-            .filter(i => i.sessionId === session.id)
+            .filter(i => i.session_id === session.id)
             .forEach(item => {
               allGameItems.push({ ...item, sessionNumber: session.number });
             });
@@ -979,6 +1272,22 @@
           case 'low': return '#3b82f6';
           default: return '#64748b';
         }
+      }
+
+      formatDuration(duration) {
+        // Handle ISO date strings or other formats
+        if (!duration) return '00:00:00';
+        if (typeof duration === 'string' && duration.includes('T')) {
+          // This is an ISO date, extract just the time
+          try {
+            const parts = duration.split('T')[1].split('.')[0];
+            return parts || '00:00:00';
+          } catch {
+            return '00:00:00';
+          }
+        }
+        // It's already in HH:MM:SS format
+        return duration;
       }
 
       renderModals() {
@@ -1104,27 +1413,13 @@
                     </div>
                   </div>
                 </div>
-                <div class="border-t border-slate-700/50 pt-4">
-                  <h4 class="text-lg font-bold text-cyan-400 mb-3">Exporter</h4>
-                  <div class="space-y-2">
-                    <button id="btn-export-json" class="w-full bg-gradient-to-r from-blue-900/50 to-blue-800/50 border border-blue-700/50 hover:border-blue-600/50 hover:from-blue-900/70 hover:to-blue-800/70 text-blue-300 px-4 py-3 rounded-lg transition text-left font-semibold text-sm">
-                      <span class="text-white">Export JSON</span><br><span class="text-xs text-blue-300/70">Données brutes</span>
-                    </button>
-                    <button id="btn-export-csv" class="w-full bg-gradient-to-r from-blue-900/50 to-blue-800/50 border border-blue-700/50 hover:border-blue-600/50 hover:from-blue-900/70 hover:to-blue-800/70 text-blue-300 px-4 py-3 rounded-lg transition text-left font-semibold text-sm">
-                      <span class="text-white">Export CSV</span><br><span class="text-xs text-blue-300/70">Pour Excel/Sheets</span>
-                    </button>
-                    <button id="btn-export-markdown" class="w-full bg-gradient-to-r from-purple-900/50 to-purple-800/50 border border-purple-700/50 hover:border-purple-600/50 hover:from-purple-900/70 hover:to-purple-800/70 text-purple-300 px-4 py-3 rounded-lg transition text-left font-semibold text-sm">
-                      <span class="text-white">Export Markdown</span><br><span class="text-xs text-purple-300/70">Format lisible</span>
-                    </button>
-                  </div>
-                </div>
-                <div class="border-t border-slate-700/50 pt-4">
-                  <h4 class="text-lg font-bold text-indigo-400 mb-3">Importer</h4>
-                  <div class="space-y-2">
-                    <button id="btn-open-import" class="w-full bg-gradient-to-r from-indigo-900/50 to-indigo-800/50 border border-indigo-700/50 hover:border-indigo-600/50 hover:from-indigo-900/70 hover:to-indigo-800/70 text-indigo-300 px-4 py-3 rounded-lg transition text-left font-semibold text-sm">
-                      <span class="text-white">Import JSON</span><br><span class="text-xs text-indigo-300/70">Charger données existantes</span>
-                    </button>
-                  </div>
+
+                <div>
+                  <h4 class="text-lg font-bold text-blue-400 mb-3">Export des Données</h4>
+                  <button id="btn-export-json" class="w-full bg-gradient-to-r from-blue-900/50 to-blue-800/50 border border-blue-700/50 hover:border-blue-600/50 hover:from-blue-900/70 hover:to-blue-800/70 text-blue-300 px-4 py-3 rounded-lg transition text-left font-semibold text-sm flex items-center gap-2">
+                    <i data-lucide="download" style="width: 16px; height: 16px;"></i>
+                    <span>Exporter en JSON</span>
+                  </button>
                 </div>
               </div>
               <button id="btn-logout" class="w-full bg-gradient-to-r from-red-900/50 to-red-800/50 border border-red-700/50 hover:border-red-600/50 hover:from-red-900/70 hover:to-red-800/70 text-red-300 px-4 py-3 rounded-lg transition text-left font-semibold text-sm mt-4">
@@ -1134,22 +1429,7 @@
               <button id="btn-cancel-settings" class="w-full bg-slate-700/50 border border-slate-600/50 hover:border-slate-500/50 text-slate-300 px-4 py-3 rounded-lg font-semibold transition mt-4">Fermer</button>
             </div>
           </div>
-          <div id="modal-import" class="hidden fixed inset-0 flex items-center justify-center z-50">
-            <div class="bg-gradient-to-br from-slate-800 to-slate-900 rounded-xl shadow-2xl p-8 w-96 border border-purple-800/50 shadow-purple-500/20">
-              <h3 class="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-purple-400 mb-6">Importer les données</h3>
-              <div class="space-y-4">
-                <div>
-                  <label class="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Fichier JSON</label>
-                  <input type="file" id="input-import-file" accept=".json" class="w-full bg-slate-700/50 border border-slate-600/50 focus:border-purple-500/50 rounded-lg px-4 py-3 text-slate-300 focus:outline-none transition">
-                </div>
-                <div id="import-status" class="text-sm text-slate-400"></div>
-              </div>
-              <div class="flex gap-3 mt-8">
-                <button id="btn-cancel-import" class="flex-1 bg-slate-700/50 border border-slate-600/50 hover:border-slate-500/50 text-slate-300 px-4 py-3 rounded-lg font-semibold transition">Annuler</button>
-                <button id="btn-confirm-import" class="flex-1 bg-gradient-to-r from-cyan-600 to-purple-600 hover:from-cyan-500 hover:to-purple-500 text-white px-4 py-3 rounded-lg font-bold transition shadow-lg shadow-purple-500/20">Importer</button>
-              </div>
-            </div>
-          </div>
+
           <div id="modal-filter-games" class="hidden fixed inset-0 flex items-center justify-center z-50">
             <div class="bg-gradient-to-br from-slate-800 to-slate-900 rounded-xl shadow-2xl p-8 w-96 border border-indigo-800/50 shadow-indigo-500/20">
               <h3 class="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-indigo-400 mb-6">Filtrer par Jeu</h3>
@@ -1215,9 +1495,11 @@
         document.getElementById('btn-confirm-delete')?.addEventListener('click', () => this.confirmDeleteSession());
         document.getElementById('btn-cancel-delete')?.addEventListener('click', () => this.hideModal('modal-delete-confirmation'));
         document.getElementById('btn-stop-session')?.addEventListener('click', () => {
-          const activeSession = this.data.sessions[this.data.sessions.length - 1];
-          this.endSession(activeSession.id);
-          this.render();
+          const activeSession = this.data.sessions.find(s => s.is_active);
+          if (activeSession) {
+            this.endSession(activeSession.id);
+            this.render();
+          }
         });
 
         // Game name dropdown toggle
@@ -1284,6 +1566,9 @@
           this.render();
         });
         
+        // Export JSON
+        document.getElementById('btn-export-json')?.addEventListener('click', () => this.exportJSON());
+        
         // Filter by games in settings
         document.getElementById('btn-filter-all-games')?.addEventListener('click', () => {
           this.currentGameFilter = null;
@@ -1299,15 +1584,6 @@
             this.render();
           });
         });
-        
-        document.getElementById('btn-export-json')?.addEventListener('click', () => this.exportJSON());
-        document.getElementById('btn-export-csv')?.addEventListener('click', () => this.exportCSV());
-        document.getElementById('btn-export-markdown')?.addEventListener('click', () => this.exportMarkdown());
-
-        // Import
-        document.getElementById('btn-open-import')?.addEventListener('click', () => this.showModal('modal-import'));
-        document.getElementById('btn-cancel-import')?.addEventListener('click', () => this.hideModal('modal-import'));
-        document.getElementById('btn-confirm-import')?.addEventListener('click', () => this.importJSON());
       }
 
       showModal(modalId) {
@@ -1320,39 +1596,72 @@
         document.getElementById('modal-overlay')?.classList.add('hidden');
       }
 
-      saveNewSession() {
-        const gameNameSelect = document.getElementById('input-session-game-name')?.value;
-        let gameName = gameNameSelect;
+      async saveNewSession() {
+        const saveBtn = document.getElementById('btn-save-session');
+        const originalText = 'Démarrer';
         
-        if (gameNameSelect === 'custom') {
-          gameName = document.getElementById('input-session-game-name-custom')?.value;
-        }
-        
-        const date = document.getElementById('input-session-date')?.value;
-        const panelSize = parseInt(document.getElementById('input-session-panel')?.value || '0');
-        const noteTaker = document.getElementById('input-session-note-taker')?.value;
-        const remarks = document.getElementById('input-session-remarks')?.value;
+        try {
+          const gameNameSelect = document.getElementById('input-session-game-name')?.value;
+          let gameName = gameNameSelect;
+          
+          if (gameNameSelect === 'custom') {
+            gameName = document.getElementById('input-session-game-name-custom')?.value;
+          }
+          
+          const date = document.getElementById('input-session-date')?.value;
+          const panelSize = parseInt(document.getElementById('input-session-panel')?.value || '0');
+          const noteTaker = document.getElementById('input-session-note-taker')?.value;
+          const remarks = document.getElementById('input-session-remarks')?.value;
 
-        if (!gameName || !date || !panelSize || !noteTaker) {
-          alert('Veuillez remplir tous les champs obligatoires');
-          return;
-        }
+          if (!gameName || !date || !panelSize || !noteTaker) {
+            alert('Veuillez remplir tous les champs obligatoires');
+            return;
+          }
 
-        this.addSession({ gameName, date, panelSize, noteTaker, remarks });
-        this.hideModal('modal-new-session');
-        
-        // Quitter la vue filtrée pour revenir à la session active
-        this.currentFilter = null;
-        this.currentGameFilter = null;
-        
-        // Reset form
-        document.getElementById('input-session-game-name').value = '';
-        document.getElementById('input-session-game-name-custom').value = '';
-        document.getElementById('input-session-game-name-custom').classList.add('hidden');
-        document.getElementById('input-session-date').value = '';
-        document.getElementById('input-session-panel').value = '';
-        document.getElementById('input-session-note-taker').value = '';
-        document.getElementById('input-session-remarks').value = '';
+          // Désactiver le bouton et afficher un état de chargement
+          if (saveBtn) {
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Création en cours...';
+          }
+          
+          // Créer la session et récupérer son ID
+          const newSessionId = await this.addSession({ gameName, date, panelSize, noteTaker, remarks });
+          
+          // Sélectionner la nouvelle session immédiatement
+          this.selectedSessionId = newSessionId;
+          
+          // Quitter les vues filtrées
+          this.currentFilter = null;
+          this.currentGameFilter = null;
+          
+          // Vider les champs du formulaire
+          document.getElementById('input-session-game-name').value = '';
+          document.getElementById('input-session-game-name-custom').value = '';
+          document.getElementById('input-session-game-name-custom').classList.add('hidden');
+          document.getElementById('input-session-date').value = '';
+          document.getElementById('input-session-panel').value = '';
+          document.getElementById('input-session-note-taker').value = '';
+          document.getElementById('input-session-remarks').value = '';
+          
+          // Fermer le modal
+          this.hideModal('modal-new-session');
+          
+          // Réinitialiser le bouton
+          if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = originalText;
+          }
+          
+        } catch (error) {
+          console.error('Erreur saveNewSession:', error);
+          alert('Erreur lors de la création de la session: ' + error.message);
+          
+          // Réinitialiser le bouton
+          if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = originalText;
+          }
+        }
       }
 
       saveNewItem() {
@@ -1364,12 +1673,23 @@
           return;
         }
 
+        // Désactiver le bouton pour éviter les double-clics
+        const saveBtn = document.getElementById('btn-save-item');
+        if (saveBtn) {
+          saveBtn.disabled = true;
+          saveBtn.textContent = 'Ajout en cours...';
+        }
+
         // Utiliser la session sélectionnée, pas toujours la dernière
-        const selectedSessionId = this.selectedSessionId || this.data.sessions[this.data.sessions.length - 1].id;
+        const selectedSessionId = this.selectedSessionId || (this.data.sessions.find(s => s.is_active)?.id) || (this.data.sessions.length > 0 ? this.data.sessions[0].id : null);
         const selectedSession = this.data.sessions.find(s => s.id === selectedSessionId);
         
         if (!selectedSession) {
           alert('Aucune session sélectionnée');
+          if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Ajouter';
+          }
           return;
         }
 
@@ -1381,7 +1701,25 @@
           content,
           assignedTo: ''
         }).then(() => {
+          // Vider et réinitialiser le formulaire
+          document.getElementById('input-item-content').value = '';
+          document.getElementById('input-item-severity').value = 'info';
+          
+          // Réinitialiser le bouton
+          if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Ajouter';
+          }
+          
           this.hideModal('modal-add-item');
+        }).catch(error => {
+          console.error('Erreur lors de l\'ajout:', error);
+          
+          // Réinitialiser le bouton en cas d'erreur
+          if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Ajouter';
+          }
         });
       }
 
@@ -1414,7 +1752,7 @@
       }
 
       deleteActiveSession() {
-        const selectedSessionId = this.selectedSessionId || this.data.sessions[this.data.sessions.length - 1].id;
+        const selectedSessionId = this.selectedSessionId || (this.data.sessions.find(s => s.is_active)?.id) || (this.data.sessions.length > 0 ? this.data.sessions[0].id : null);
         const selectedSession = this.data.sessions.find(s => s.id === selectedSessionId);
         if (selectedSession) {
           this.deleteSession(selectedSessionId);
@@ -1423,7 +1761,7 @@
       }
 
       confirmDeleteSession() {
-        const selectedSessionId = this.selectedSessionId || this.data.sessions[this.data.sessions.length - 1].id;
+        const selectedSessionId = this.selectedSessionId || (this.data.sessions.find(s => s.is_active)?.id) || (this.data.sessions.length > 0 ? this.data.sessions[0].id : null);
         const selectedSession = this.data.sessions.find(s => s.id === selectedSessionId);
         if (selectedSession) {
           this.deleteSession(selectedSessionId);
@@ -1486,146 +1824,11 @@
       new PlaytestManager();
     });
   </script>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script>
-    // Initialize Supabase
-    const SUPABASE_URL = 'https://bjwhvtfqtkuxcnndlatl.supabase.co';
-    const SUPABASE_KEY = 'sb_publishable_e19G5RISrAvasckcwql0CQ_M8Ar8Mod';
-    const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
-    
-    let isSyncingToSupabase = false;
-    let hasLoadedFromSupabase = false;
-
-    window.supabaseSync = {
-      async createEntry(payload) {
-        if (isSyncingToSupabase) return null;
-        isSyncingToSupabase = true;
-        try {
-          const { data, error } = await supabase
-            .from('playtest_entries')
-            .insert(payload)
-            .select('id')
-            .single();
-          if (error) throw error;
-          return data?.id ?? null;
-        } finally {
-          isSyncingToSupabase = false;
-        }
-      },
-      async updateEntry(id, payload) {
-        if (isSyncingToSupabase) return;
-        isSyncingToSupabase = true;
-        try {
-          const { error } = await supabase
-            .from('playtest_entries')
-            .update(payload)
-            .eq('id', id);
-          if (error) throw error;
-        } finally {
-          isSyncingToSupabase = false;
-        }
-      },
-      async deleteEntry(id) {
-        if (isSyncingToSupabase) return;
-        isSyncingToSupabase = true;
-        try {
-          const { error } = await supabase
-            .from('playtest_entries')
-            .delete()
-            .eq('id', id);
-          if (error) throw error;
-        } finally {
-          isSyncingToSupabase = false;
-        }
-      }
-    };
-
-    // Load data from Supabase on app start
-    async function loadDataFromSupabase() {
-      if (hasLoadedFromSupabase) return;
-      
-      try {
-        const { data, error } = await supabase
-          .from('playtest_entries')
-          .select('*');
-        
-        if (error) {
-          console.error('Erreur Supabase:', error);
-          return;
-        }
-
-        if (data && data.length > 0) {
-          // Reconstruct data structure from Supabase
-          const sessions = new Map();
-          const items = [];
-
-          data.forEach(entry => {
-            // Create session if not exists
-            if (!sessions.has(entry.session_id)) {
-              sessions.set(entry.session_id, {
-                id: entry.session_id,
-                gameName: entry.game_name || 'Unknown',
-                date: entry.session_date || new Date().toISOString().split('T')[0],
-                number: sessions.size + 1,
-                panelSize: 0,
-                noteTaker: 'Imported',
-                remarks: '',
-                startTime: new Date().toLocaleTimeString('fr-FR'),
-                startTimestamp: Date.now(),
-                isActive: false,
-                duration: '00:00:00',
-                createdAt: entry.created_at || new Date().toISOString()
-              });
-            }
-
-            // Add item
-            items.push({
-              id: entry.id,
-              sessionId: entry.session_id,
-              type: entry.type,
-              severity: entry.severity,
-              content: entry.content,
-              tags: '',
-              time: new Date().toLocaleTimeString('fr-FR'),
-              elapsedTime: entry.elapsed_time || '00:00:00',
-              createdAt: entry.created_at || new Date().toISOString(),
-              wasAddedDuringSession: entry.was_added_during_session,
-              __backendId: entry.id
-            });
-          });
-
-          // Update localStorage with Supabase data (merge sans doublons)
-          const existingData = JSON.parse(localStorage.getItem(STORAGE_KEY)) || { sessions: [], items: [] };
-
-          const existingSessionsById = new Map((existingData.sessions || []).map(s => [s.id, s]));
-          for (const s of Array.from(sessions.values())) existingSessionsById.set(s.id, s);
-
-          const existingItemsByBackendId = new Map(
-            (existingData.items || [])
-              .filter(i => i && i.__backendId)
-              .map(i => [i.__backendId, i])
-          );
-          for (const it of items) existingItemsByBackendId.set(it.__backendId, it);
-
-          const existingLocalOnlyItems = (existingData.items || []).filter(i => !i?.__backendId);
-          existingData.sessions = Array.from(existingSessionsById.values());
-          existingData.items = [...existingLocalOnlyItems, ...Array.from(existingItemsByBackendId.values())];
-          
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(existingData));
-          hasLoadedFromSupabase = true;
-        }
-      } catch (error) {
-        console.error('Erreur chargement Supabase:', error);
-      }
-    }
-
-    // Load data on script init
-    window.addEventListener('load', () => {
-      loadDataFromSupabase();
-    });
-  </script>
+  <style>body { box-sizing: border-box; }</style>
+  <script src="/_sdk/data_sdk.js" type="text/javascript"></script>
+  <script src="/_sdk/element_sdk.js" type="text/javascript"></script>
  </head>
  <body>
   <div id="app"></div>
- <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9ee4f7b6529b3b5e',t:'MTc3NjUyODkyMC4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+ <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9ef28b3550e4020d',t:'MTc3NjY3MTI3Ni4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
