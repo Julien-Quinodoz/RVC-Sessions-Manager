@@ -124,6 +124,12 @@
           
           // C'est une session si: id existe ET game_name existe ET type vide (colonne 12)
           if (idValue && gameNameValue && !itemTypeValue) {
+            // Parse start_timestamp - must be a number
+            let startTimestamp = parseInt(row[8]) || 0;
+            if (isNaN(startTimestamp) || startTimestamp === 0) {
+              startTimestamp = Date.now(); // Fallback
+            }
+            
             this.data.sessions.push({
               id: idValue,
               number: parseInt(row[1]) || 0,
@@ -133,9 +139,9 @@
               note_taker: String(row[5] || '').trim(),
               remarks: String(row[6] || '').trim(),
               start_time: String(row[7] || '').trim(),
-              start_timestamp: parseInt(row[8]) || 0,
+              start_timestamp: startTimestamp,
               is_active: row[9] === 'TRUE' || row[9] === true,
-              duration: String(row[10] || '').trim(),
+              duration: this.ensureTimeFormat(String(row[10] || '00:00:00')),
               created_at: String(row[11] || new Date().toISOString())
             });
           } 
@@ -149,12 +155,35 @@
               session_id: sessionIdValue,
               game_name: String(row[16] || '').trim(),
               session_date: String(row[17] || '').trim(),
-              elapsed_time: String(row[18] || '').trim(),
+              elapsed_time: this.ensureTimeFormat(String(row[18] || '00:00:00')),
               was_added_during_session: row[19] === 'TRUE' || row[19] === true,
               created_at: String(row[20] || new Date().toISOString())
             });
           }
         }
+      }
+
+      ensureTimeFormat(timeStr) {
+        // Ensure time is in HH:MM:SS format, handle various bad formats
+        const str = String(timeStr || '').trim();
+        
+        // Already in good format
+        if (/^\d{2}:\d{2}:\d{2}$/.test(str)) {
+          return str;
+        }
+        
+        // ISO date string like "1899-12-29T23:00:23.000Z"
+        if (str.includes('T')) {
+          try {
+            const timePart = str.split('T')[1].split('.')[0]; // Extract HH:MM:SS
+            if (/^\d{2}:\d{2}:\d{2}$/.test(timePart)) {
+              return timePart;
+            }
+          } catch (e) {}
+        }
+        
+        // Default fallback
+        return '00:00:00';
       }
 
       async create(record) {
@@ -293,6 +322,7 @@
         this.currentItemType = null;
         this.currentEditItemId = null;
         this.data = { sessions: [], items: [] };
+        this.sortJournalBySeverity = false;
         this.initializeApp();
       }
 
@@ -375,7 +405,7 @@
           game_name: session?.game_name || '',
           session_date: session?.date || '',
           elapsed_time: elapsedTime,
-          was_added_during_session: session?.is_active,
+          was_added_during_session: session?.is_active ? 'TRUE' : 'FALSE',
           created_at: new Date().toISOString()
         };
 
@@ -499,10 +529,22 @@
       async endSession(sessionId) {
         const session = this.data.sessions.find(s => s.id === sessionId);
         if (session) {
+          // Calculate duration properly using timestamps
+          const startTime = typeof session.start_timestamp === 'string' 
+            ? parseInt(session.start_timestamp) 
+            : session.start_timestamp;
+          const endTime = Date.now();
+          const elapsed = endTime - startTime;
+          
+          const hours = Math.floor(elapsed / 3600000);
+          const minutes = Math.floor((elapsed % 3600000) / 60000);
+          const seconds = Math.floor((elapsed % 60000) / 1000);
+          const durationStr = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+          
           const updatedSession = {
             ...session,
             is_active: false,
-            duration: this.getSessionElapsedTime(sessionId)
+            duration: durationStr
           };
           
           await storage.update(updatedSession);
@@ -518,24 +560,50 @@
         const session = this.data.sessions.find(s => s.id === sessionId);
         if (!session) return '';
         
-        const sessionItems = this.data.items
+        let sessionItems = this.data.items
           .filter(i => i.session_id === sessionId);
         
+        if (this.sortJournalBySeverity) {
+          const severityOrder = { critical: 0, high: 1, medium: 2, low: 3, info: 4, archived: 5 };
+          sessionItems.sort((a, b) => {
+            const aSeverity = severityOrder[a.severity] ?? 6;
+            const bSeverity = severityOrder[b.severity] ?? 6;
+            return aSeverity - bSeverity;
+          });
+        }
+        
         if (sessionItems.length === 0) {
-          return `<div>[${session.start_time}] Aucune entrée enregistrée</div>`;
+          return `<div class="font-mono text-sm">[${session.start_time}] Aucune entrée enregistrée</div>`;
         }
 
         return sessionItems.map(item => {
-          const typeEmoji = {
-            bug: '[BUG]',
-            feedback: '[RETOUR]',
-            suggestion: '[SUGGESTION]',
-            task: '[TÂCHE]',
-            debrief: '[DEBRIEF]'
-          }[item.type] || '[?]';
+          const typeLabel = {
+            bug: 'BUG',
+            feedback: 'INFO',
+            suggestion: 'SUGGESTION',
+            task: 'LOG',
+            debrief: 'DÉBRIEF'
+          }[item.type] || 'AUTRE';
+          
+          const severityLabel = {
+            critical: 'C',
+            high: 'E',
+            medium: 'M',
+            low: 'F',
+            info: 'I',
+            archived: 'A'
+          }[item.severity] || '?';
           
           const timeDisplay = item.was_added_during_session ? item.elapsed_time : '[Après session]';
-          return `<div>${timeDisplay} ${typeEmoji} ${item.content.substring(0, 60)}...</div>`;
+          
+          // Ne pas afficher le timing si le tri par sévérité est activé
+          const displayContent = this.sortJournalBySeverity 
+            ? `[${severityLabel}] [${typeLabel}] ${item.content}`
+            : `${timeDisplay}&nbsp;&nbsp;&nbsp;&nbsp;[${severityLabel}] [${typeLabel}] ${item.content}`;
+          
+          return `<div class="font-mono text-sm leading-relaxed">
+            <span>${displayContent}</span>
+          </div>`;
         }).join('');
       }
 
@@ -605,6 +673,76 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+      }
+
+      downloadSessionJournal(sessionId) {
+        const session = this.data.sessions.find(s => s.id === sessionId);
+        if (!session) return;
+
+        const journalText = this.generateSessionJournalText(sessionId);
+        const filename = `Session_${session.number}_Journal_${new Date().toISOString().split('T')[0]}.txt`;
+        const blob = new Blob([journalText], { type: 'text/plain;charset=utf-8' });
+        this.downloadFile(blob, filename);
+      }
+
+      generateSessionJournalText(sessionId) {
+        const session = this.data.sessions.find(s => s.id === sessionId);
+        if (!session) return '';
+
+        let text = `RÉSUMÉ DE SESSION - JOURNAL\n`;
+        text += `${'='.repeat(60)}\n\n`;
+        text += `Session ${session.number} - ${session.game_name}\n`;
+        text += `Date: ${session.date}\n`;
+        text += `Durée: ${session.duration}\n`;
+        text += `Panel: ${session.panel_size} joueurs\n`;
+        text += `Preneur de notes: ${session.note_taker}\n`;
+        text += `${'='.repeat(60)}\n\n`;
+
+        let sessionItems = this.data.items.filter(i => i.session_id === sessionId);
+        if (sessionItems.length === 0) {
+          text += `Aucune entrée enregistrée\n`;
+          return text;
+        }
+
+        // Appliquer le même tri que l'affichage journal
+        if (this.sortJournalBySeverity) {
+          const severityOrder = { critical: 0, high: 1, medium: 2, low: 3, info: 4, archived: 5 };
+          sessionItems.sort((a, b) => {
+            const aSeverity = severityOrder[a.severity] ?? 6;
+            const bSeverity = severityOrder[b.severity] ?? 6;
+            return aSeverity - bSeverity;
+          });
+        }
+
+        sessionItems.forEach(item => {
+          const typeLabel = {
+            bug: 'BUG',
+            feedback: 'INFO',
+            suggestion: 'SUGGESTION',
+            task: 'LOG',
+            debrief: 'DÉBRIEF'
+          }[item.type] || 'AUTRE';
+          
+          const severityLabel = {
+            critical: 'C',
+            high: 'E',
+            medium: 'M',
+            low: 'F',
+            info: 'I',
+            archived: 'A'
+          }[item.severity] || '?';
+          
+          const timeDisplay = item.was_added_during_session ? item.elapsed_time : '[Après session]';
+          
+          // Ne pas afficher le timing si le tri par sévérité est activé
+          if (this.sortJournalBySeverity) {
+            text += `[${severityLabel}] [${typeLabel}] ${item.content}\n`;
+          } else {
+            text += `${timeDisplay} [${severityLabel}] [${typeLabel}] ${item.content}\n`;
+          }
+        });
+
+        return text;
       }
 
       importJSON() {
@@ -704,17 +842,21 @@
           items = items.filter(i => sessions.some(s => s.id === i.session_id));
         }
         
-        // Ne pas exclure les éléments archivés des statistiques
-        const bugs = items.filter(i => i.type === 'bug');
+        // Exclure les éléments archivés du compteur total
+        const activeItems = items.filter(i => i.severity !== 'archived');
+        const bugs = activeItems.filter(i => i.type === 'bug');
         const openBugs = bugs.filter(i => i.status === 'open');
-        const allCritical = items.filter(i => i.severity === 'critical');
-        const allHigh = items.filter(i => i.severity === 'high');
-        const allLow = items.filter(i => i.severity === 'low');
-        const allInfo = items.filter(i => i.severity === 'info');
+        const allCritical = activeItems.filter(i => i.severity === 'critical');
+        const allHigh = activeItems.filter(i => i.severity === 'high');
+        const allLow = activeItems.filter(i => i.severity === 'low');
+        const allInfo = activeItems.filter(i => i.severity === 'info');
+        
+        // Le total d'entrées = nombre d'entrées critiques + élevées + faibles (actives uniquement)
+        const totalActiveEntries = allCritical.length + allHigh.length + allLow.length;
         
         return {
           totalSessions: sessions.length,
-          totalItems: items.length,
+          totalItems: totalActiveEntries,
           totalBugs: bugs.length,
           openBugs: openBugs.length,
           criticalBugs: allCritical.length,
@@ -901,7 +1043,7 @@
                         <div class="flex-1">
                           <div class="text-sm font-bold text-cyan-300">Session ${s.number}</div>
                           <div class="text-xs text-purple-300 font-semibold mt-1">${s.game_name || 'N/A'}</div>
-                          <div class="text-xs text-slate-500 mt-2">${s.date || 'N/A'}</div>
+                          <div class="text-xs text-slate-500 mt-2">${this.formatSessionDate(s.date) || 'N/A'}</div>
                           <div class="text-xs text-slate-600 mt-2 flex gap-2">
                             <span>${s.panel_size || 0} joueurs</span>
                             <span>${s.duration || '00:00:00'}</span>
@@ -1029,9 +1171,9 @@
                 
                 const typeLabel = {
                   bug: 'Bug',
-                  feedback: 'Retours',
+                  feedback: 'Info',
                   suggestion: 'Suggestions',
-                  task: 'Tâches',
+                  task: 'Log',
                   debrief: 'Débriefings'
                 }[type];
 
@@ -1067,7 +1209,19 @@
             </div>
             <div class="max-w-5xl mx-auto w-full">
               <div class="bg-gradient-to-br from-slate-800/50 to-slate-900/50 border border-slate-700/50 rounded-lg p-6 mt-12">
-                <h3 class="text-lg font-bold text-white mb-4 uppercase tracking-wider text-center">Résumé de la Session - Journal</h3>
+                <div class="flex justify-between items-center mb-4">
+                  <h3 class="text-lg font-bold text-white uppercase tracking-wider">Résumé de la Session - Journal</h3>
+                  <div class="flex gap-2">
+                    <button id="btn-toggle-sort-journal" class="bg-gradient-to-r from-green-900/40 to-green-800/40 border border-green-700/30 hover:border-green-600/50 hover:from-green-900/60 hover:to-green-800/60 px-4 py-2 rounded-lg text-green-300 text-sm font-bold transition shadow-lg shadow-green-500/10 flex items-center gap-2">
+                      <i data-lucide="sort-asc" style="width: 16px; height: 16px;"></i>
+                      <span id="sort-journal-label">${this.sortJournalBySeverity ? 'Trier par chronologie' : 'Trier par critique'}</span>
+                    </button>
+                    <button id="btn-download-journal" class="bg-gradient-to-r from-cyan-600 to-purple-600 hover:from-cyan-500 hover:to-purple-500 px-4 py-2 rounded-lg text-white text-sm font-bold transition shadow-lg shadow-purple-500/20 flex items-center gap-2">
+                      <i data-lucide="download" style="width: 16px; height: 16px;"></i>
+                      Télécharger
+                    </button>
+                  </div>
+                </div>
                 <div class="space-y-2 text-sm text-slate-300">
                   ${this.generateSessionSummary(selectedSession.id) || '<div class="text-center text-slate-500 italic">Aucune entrée enregistrée</div>'}
                 </div>
@@ -1279,6 +1433,21 @@
         }
         // It's already in HH:MM:SS format
         return duration;
+      }
+
+      formatSessionDate(dateStr) {
+        if (!dateStr) return 'N/A';
+        // Handle ISO format like "2026-04-23T22:00:00.000Z"
+        if (dateStr.includes('T')) {
+          try {
+            const date = new Date(dateStr);
+            return date.toLocaleDateString('fr-FR');
+          } catch {
+            return dateStr;
+          }
+        }
+        // Already in proper format
+        return dateStr;
       }
 
       renderModals() {
@@ -1598,6 +1767,20 @@
         // Export JSON
         document.getElementById('btn-export-json')?.addEventListener('click', () => this.exportJSON());
         
+        // Download session journal
+        document.getElementById('btn-download-journal')?.addEventListener('click', () => {
+          const selectedSessionId = this.selectedSessionId || (this.data.sessions.find(s => s.is_active)?.id) || (this.data.sessions.length > 0 ? this.data.sessions[0].id : null);
+          if (selectedSessionId) {
+            this.downloadSessionJournal(selectedSessionId);
+          }
+        });
+        
+        // Toggle sort journal by severity
+        document.getElementById('btn-toggle-sort-journal')?.addEventListener('click', () => {
+          this.sortJournalBySeverity = !this.sortJournalBySeverity;
+          this.render();
+        });
+        
         // Filter archived items
         document.getElementById('btn-filter-archived')?.addEventListener('click', () => {
           this.currentFilter = 'archived';
@@ -1679,6 +1862,9 @@
             saveBtn.disabled = false;
             saveBtn.textContent = originalText;
           }
+          
+          // Re-render pour afficher la nouvelle session
+          this.render();
           
         } catch (error) {
           console.error('Erreur saveNewSession:', error);
@@ -1858,5 +2044,5 @@
  </head>
  <body>
   <div id="app"></div>
- <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9f2f52e4a057039d',t:'MTc3NzMwODYwMS4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+ <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9f346dc2a5612ff1',t:'MTc3NzM2MjEzMC4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
